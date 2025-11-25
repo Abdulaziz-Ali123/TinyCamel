@@ -1,5 +1,6 @@
 import requests
 import re
+import os
 
 url = "http://192.168.4.1/stream"
 
@@ -42,6 +43,7 @@ while True:
     jpeg = raw.read(length)
 
     # 5. Save the JPEG
+    os.makedirs("images", exist_ok=True)
     with open("images/"+label, "wb") as f:
         f.write(jpeg)
 
