@@ -1,52 +1,50 @@
 import requests
 import re
+import os
 
-url = "http://192.168.4.1/stream"   # ESP32 AP default
+url = "http://192.168.4.1/stream"
 
-# Boundary
 boundary = b"--frame"
-
-# Regex for label header
 label_re = re.compile(rb"X-Label:(.*)\r\n")
 
 print("Connecting to ESP32 stream...")
 
 r = requests.get(url, stream=True)
+raw = r.raw  # raw socket-level reader
 
-buffer = b""
+while True:
+    # 1. Read until boundary
+    line = raw.readline()
+    if boundary not in line:
+        continue
 
-for chunk in r.iter_content(chunk_size=1024):
-    buffer += chunk
+    # 2. Read headers
+    headers = b""
+    while True:
+        line = raw.readline()
+        if line == b"\r\n":
+            break
+        headers += line
 
-    # Look for frame boundary
-    if boundary in buffer:
-        parts = buffer.split(boundary)
-        frame_part = parts[-1]  # newest
+    # 3. Extract label and content length
+    m_label = label_re.search(headers)
+    if not m_label:
+        continue
 
-        # Extract label header
-        header_end = frame_part.find(b"\r\n\r\n")
-        header = frame_part[:header_end]
+    label = m_label.group(1).decode().strip() + ".jpg"
 
-        match = label_re.search(header)
-        if not match:
-            continue
+    m_len = re.search(rb"Content-Length:\s*(\d+)", headers)
+    if not m_len:
+        continue
 
-        label = match.group(1).decode().strip()
-        filename = label
+    length = int(m_len.group(1))
 
-        # Extract JPEG
-        jpeg = frame_part[header_end+4:]
+    # 4. Read EXACT JPEG bytes
+    jpeg = raw.read(length)
 
-        # Truncate if boundary appears inside jpeg
-        next_bound = jpeg.find(boundary)
-        if next_bound != -1:
-            jpeg = jpeg[:next_bound]
+    # 5. Save the JPEG
+    os.makedirs("images", exist_ok=True)
+    with open("images/"+label, "wb") as f:
+        f.write(jpeg)
 
-        # Save file
-        with open(filename, "wb") as f:
-            f.write(jpeg)
-
-        print("Saved", filename)
-
-        # Reset buffer
-        buffer = b""
+    print("Saved", label)
