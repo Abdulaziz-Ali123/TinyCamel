@@ -1,14 +1,25 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Arduino.h>
 #include "esp_camera.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h" // Easier for debugging, switch to mutable if space is tight
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "model_data.h" 
 
-// ---------------- CAMERA PINS (XIAO ESP32C3) ----------------
+// ---------------- MEMORY CONFIG (PSRAM) ----------------
+// We use 1MB of PSRAM for the arena. 
+// This fits MobileNetV2 easily.
+constexpr int kTensorArenaSize = 1024 * 1024; 
+uint8_t* tensorArena; 
+
+// ---------------- CAMERA PINS (XIAO ESP32S3) ----------------
+// ... (Your existing pin definitions remain the same) ...
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
 #define SIOD_GPIO_NUM     40
 #define SIOC_GPIO_NUM     39
-
 #define Y9_GPIO_NUM       48
 #define Y8_GPIO_NUM       11
 #define Y7_GPIO_NUM       12
@@ -17,7 +28,6 @@
 #define Y4_GPIO_NUM       18
 #define Y3_GPIO_NUM       17
 #define Y2_GPIO_NUM       15
-
 #define VSYNC_GPIO_NUM    38
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
@@ -26,322 +36,125 @@
 #define EN1 9
 #define IN1 8
 #define IN2 7
-
 #define IN3 4
 #define IN4 5
-#define EN2 6 // PWM speed control
+#define EN2 6 
 
-// ---------------- WIFI AP ----------------
-const char* ssid = "ESP32-CAR";
+// ---------------- TFLite Objects ----------------
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+// MobileNetV2 requires more Ops than your previous list.
+// Using AllOpsResolver ensures we don't crash due to missing Ops like PAD or RELU6.
+tflite::AllOpsResolver resolver; 
+
+// ... (Keep your WiFi, WebServer, and Motor helper functions here) ...
+const char* ssid = "ESP32-CAR2";
 const char* password = "12345678";
-
 WebServer server(80);
-
-bool streaming = false;
-WiFiClient streamClient;
-
-unsigned long lastStreamTime = 0;
-const unsigned long streamInterval = 40;  // 25 FPS
-
-// Label + frame tracking
 int pwmValue = 200;
-uint32_t frameCounter = 0;
 
-int label_fw   = 0;
-int label_left = 0;
-int label_right= 0;
-int label_back = 0;
-
-// -----------------------------------------------------------
-// HTML PAGE (MULTI-KEY HANDLING)
-// -----------------------------------------------------------
-String htmlPage = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<title>ESP32-C3 RC Car</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body { background:#111; color:white; text-align:center; font-family:Arial; }
-img { width:92%; border-radius:12px; margin-top:10px; }
-input { width:80%; }
-</style>
-</head>
-<body>
-
-<h2>ESP32-C3 RC CAR</h2>
-<img src="/stream">
-
-<h3>Speed</h3>
-<input type="range" min="0" max="255" value="200" id="speedSlider"
-       oninput="updateSpeed(this.value)">
-<p>Speed: <span id="speedVal">200</span></p>
-
-<script>
-let keys = { w:0, a:0, s:0, d:0 };
-let lastSent = "";
-
-function getCommand() {
-    let fw = keys.w;
-    let bk = keys.s;
-    let lt = keys.a;
-    let rt = keys.d;
-
-    if (fw && lt) return "fl";
-    if (fw && rt) return "fr";
-    if (bk && lt) return "bl";
-    if (bk && rt) return "br";
-
-    if (fw) return "f";
-    if (bk) return "b";
-    if (lt) return "l";
-    if (rt) return "r";
-
-    return "s";
-}
-
-function updateCommand() {
-    let cmd = getCommand();
-    if (cmd !== lastSent) {
-        fetch("/cmd?dir=" + cmd);
-        lastSent = cmd;
+// ---------------- PREPROCESS ----------------
+// Optimized to crop center 96x96 from QVGA (320x240)
+void preprocessFrame(camera_fb_t* fb, TfLiteTensor* input){
+    int start_x = (fb->width - 96) / 2;
+    int start_y = (fb->height - 96) / 2;
+    
+    for (int y = 0; y < 96; y++) {
+        for (int x = 0; x < 96; x++) {
+            // Calculate index in the source QVGA buffer
+            int src_idx = ((start_y + y) * fb->width) + (start_x + x);
+            
+            // MobileNetV2 (ImageNet) expects 3 channels (RGB) even if grayscale image
+            // We replicate the grayscale pixel to R, G, and B channels.
+            // INT8 Quantization usually expects range [-128, 127]
+            // We take uint8 (0-255) -> subtract 128 -> int8
+            int8_t pixel = (int8_t)(fb->buf[src_idx] - 128); 
+            
+            input->data.int8[(y * 96 * 3) + (x * 3) + 0] = pixel; // R
+            input->data.int8[(y * 96 * 3) + (x * 3) + 1] = pixel; // G
+            input->data.int8[(y * 96 * 3) + (x * 3) + 2] = pixel; // B
+        }
     }
 }
 
-document.addEventListener("keydown", e => {
-    let k = e.key.toLowerCase();
-    if (k === "a"){
-        keys.w = 1;
-        keys.a = 1;
-    }else if (k === "d"){
-        keys.w = 1;
-        keys.d = 1;
-    }else if (k in keys) {
-        keys[k] = 1;
-    }
-    updateCommand();
-});
-
-document.addEventListener("keyup", e => {
-    let k = e.key.toLowerCase();
-    if (k === "a"){
-        keys.a = 0;
-        keys.w = 0;
-    }else if (k === "d"){
-        keys.d = 0;
-        keys.w = 0;
-    }else if (k in keys) {
-        keys[k] = 0;    
-    }
-    updateCommand();
-});
-
-function updateSpeed(v){
-  document.getElementById("speedVal").innerText = v;
-  fetch("/speed?val=" + v);
-}
-</script>
-
-</body>
-</html>
-)rawliteral";
-
-// -----------------------------------------------------------
-// MOTOR + LABEL CONTROL
-// -----------------------------------------------------------
-void resetLabels() {
-  label_fw = label_left = label_right = label_back = 0;
-}
-
-void applyLabel(String dir) {
-  resetLabels();
-  if (dir == "f") label_fw = 1;
-  if (dir == "b") label_back = 1;
-  if (dir == "l") label_left = 1;
-  if (dir == "r") label_right = 1;
-  if (dir == "fl") { label_fw=1; label_left=1; }
-  if (dir == "fr") { label_fw=1; label_right=1; }
-  if (dir == "bl") { label_back=1; label_left=1; }
-  if (dir == "br") { label_back=1; label_right=1; }
-}
-
-void stopMotors() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-}
-
-void forward()  { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
-void backward() { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
-void left()     { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
-void right()    { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
-
-void fwLeft() { left(); forward(); }
-void fwRight(){ right(); forward(); }
-void bwLeft() { left(); backward(); }
-void bwRight(){ right(); backward(); }
-
-// -----------------------------------------------------------
-// STREAM FRAME WITH LABELS
-// -----------------------------------------------------------
-void streamOneFrame() {
-  if (!streaming) return;
-  if (!streamClient.connected()) { streaming = false; return; }
-
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) return;
-
-  // Build metadata filename string
-  char labelString[80];
-  sprintf(labelString, "%lu %d %d %d %d %d.jpg",
-          frameCounter,
-          label_fw, label_left, label_right, label_back,
-          pwmValue);
-
-  // Serial debug print
-  Serial.print("[FRAME] ");
-  Serial.print(labelString);
-  Serial.print(" | Size: ");
-  Serial.print(fb->len);
-  Serial.println(" bytes");
-
-  // Send MJPEG header
-  streamClient.printf(
-    "--frame\r\n"
-    "Content-Type:image/jpeg\r\n"
-    "X-Label:%s\r\n"
-    "Content-Length:%u\r\n\r\n",
-    labelString, fb->len
-  );
-
-  // Send JPEG image
-  streamClient.write(fb->buf, fb->len);
-  streamClient.write("\r\n");
-
-  frameCounter++;
-
-  esp_camera_fb_return(fb);
-}
-
-// -----------------------------------------------------------
-// HANDLE COMMANDS (LABEL + MOTORS)
-// -----------------------------------------------------------
-void handle_cmd() {
-  String dir = server.arg("dir");
-
-  applyLabel(dir);
-
-  if (dir == "f") forward();
-  else if (dir == "b") backward();
-  else if (dir == "l") left();
-  else if (dir == "r") right();
-  else if (dir == "fl") fwLeft();
-  else if (dir == "fr") fwRight();
-  else if (dir == "bl") bwLeft();
-  else if (dir == "br") bwRight();
-  else stopMotors();
-
-  server.send(200, "text/plain", "OK");
-}
-
-// -----------------------------------------------------------
-void handle_speed() {
-  pwmValue = constrain(server.arg("val").toInt(), 0, 255);
-  ledcWrite(0, pwmValue);
-  server.send(200, "text/plain", "OK");
-}
-
-// -----------------------------------------------------------
-void handle_jpg_stream() {
-  streamClient = server.client();
-  streaming = true;
-
-  streamClient.println("HTTP/1.1 200 OK");
-  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-  streamClient.println();
-
-  resetLabels();
-}
-
-// -----------------------------------------------------------
-// SETUP
-// -----------------------------------------------------------
 void setup() {
-  delay(1500);
   Serial.begin(115200);
-  delay(300);
-
-  Serial.println("\n=== ESP32-C3 RC CAR STARTING ===");
-
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
-
-  pinMode(EN1, OUTPUT);
-  digitalWrite(EN1, HIGH);
-
-  ledcAttachPin(EN2, 0);
-  ledcSetup(0, 20000, 8);
-  ledcWrite(0, pwmValue);
-
-  stopMotors();
-
-  WiFi.softAP(ssid, password);
-  Serial.print("[WiFi] ");
-  Serial.println(WiFi.softAPIP());
-
-  // Camera init
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 2;
-
-  esp_camera_init(&config);
-
-  // Routes
-  server.on("/", [](){ server.send(200, "text/html", htmlPage); });
-  server.on("/cmd", handle_cmd);
-  server.on("/stream", handle_jpg_stream);
-  server.on("/speed", handle_speed);
-
-  server.begin();
-  Serial.println("[Server] Running");
-}
-
-// -----------------------------------------------------------
-void loop() {
-  server.handleClient();
-
-  if (streaming) {
-    unsigned long now = millis();
-    if (now - lastStreamTime >= streamInterval) {
-      lastStreamTime = now;
-      streamOneFrame();
-    }
+  
+  // 1. Initialize PSRAM for Tensor Arena
+  if(psramFound()){
+      Serial.println("PSRAM Found! Allocating Arena...");
+      tensorArena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM);
+  } else {
+      Serial.println("Error: PSRAM not found! Model will not fit.");
+      return; 
   }
+
+  // 2. Camera Init (Use QVGA to be safe, then crop)
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0; 
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM; config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM; config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE; 
+  config.frame_size = FRAMESIZE_QVGA; // 320x240
+  config.jpeg_quality = 12; 
+  config.fb_count = 1;
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) { Serial.printf("Camera init failed 0x%x", err); return; }
+
+  // 3. TFLite Init
+  const tflite::Model* model = tflite::GetModel(TinyCamel_Q8_tflite); // Ensure this matches your header array name
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+      Serial.println("Model schema mismatch!");
+      return;
+  }
+  
+  interpreter = new tflite::MicroInterpreter(model, resolver, tensorArena, kTensorArenaSize);
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+      Serial.println("AllocateTensors() failed");
+      return;
+  }
+  input = interpreter->input(0);
+  
+  Serial.println("Setup Complete");
 }
+
+void loop() {
+    // ... (Your WiFi handling logic) ...
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) return;
+
+    // Preprocess: Crop 96x96 from center and normalize
+    preprocessFrame(fb, input);
+
+    // Inference
+    TfLiteStatus invoke_status = interpreter->Invoke();
+    if (invoke_status != kTfLiteOk) {
+        Serial.println("Invoke failed");
+    }
+
+    // Output parsing (INT8)
+    TfLiteTensor* output = interpreter->output(0);
+    // Values are -128 to 127. The index with the highest value is the prediction.
+    int8_t max_score = -128;
+    int pred_class = -1;
+    
+    for (int i = 0; i < 3; i++) {
+        if (output->data.int8[i] > max_score) {
+            max_score = output->data.int8[i];
+            pred_class = i;
+        }
+    }
+    
+    Serial.printf("Class: %d (Score: %d)\n", pred_class, max_score);
+    
+
+    esp_camera_fb_return(fb);
+}
+
