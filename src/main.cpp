@@ -2,19 +2,17 @@
 #include <WebServer.h>
 #include <Arduino.h>
 #include "esp_camera.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h" // Easier for debugging, switch to mutable if space is tight
+#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "model_data.h" 
 
 // ---------------- MEMORY CONFIG (PSRAM) ----------------
-// We use 1MB of PSRAM for the arena. 
-// This fits MobileNetV2 easily.
+// We use 1MB of PSRAM to ensure the model fits without crashing
 constexpr int kTensorArenaSize = 1024 * 1024; 
 uint8_t* tensorArena; 
 
 // ---------------- CAMERA PINS (XIAO ESP32S3) ----------------
-// ... (Your existing pin definitions remain the same) ...
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -32,64 +30,111 @@ uint8_t* tensorArena;
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// ---------------- MOTOR PINS ----------------
-#define EN1 9
+// ---------------- MOTOR PINS (Your Hardware Config) ----------------
+// Motor A = Steering (Left/Right)
+#define EN1 9 
 #define IN1 8
 #define IN2 7
+
+// Motor B = Throttle (Forward/Backward)
 #define IN3 4
 #define IN4 5
-#define EN2 6 
+#define EN2 6 // PWM Speed Control
+
+// Speed Settings
+int speedVal = 220; // 0-255 (Adjust if too fast/slow)
 
 // ---------------- TFLite Objects ----------------
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
-// MobileNetV2 requires more Ops than your previous list.
-// Using AllOpsResolver ensures we don't crash due to missing Ops like PAD or RELU6.
 tflite::AllOpsResolver resolver; 
 
-// ... (Keep your WiFi, WebServer, and Motor helper functions here) ...
-const char* ssid = "ESP32-CAR2";
+// ---------------- WIFI & SERVER ----------------
+const char* ssid = "ESP32-CAR";
 const char* password = "12345678";
 WebServer server(80);
-int pwmValue = 200;
+
+// ---------------- MOTOR FUNCTIONS ----------------
+void setupMotors() {
+    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+    pinMode(EN1, OUTPUT); pinMode(EN2, OUTPUT);
+
+    // EN1 is for Steering - Always HIGH for max torque
+    digitalWrite(EN1, HIGH);
+
+    // EN2 is for Throttle - PWM for speed control
+    // IMPORTANT: Use Channel 2 to avoid conflict with Camera (Channel 0)
+    ledcAttachPin(EN2, 2); 
+    ledcSetup(2, 20000, 8);
+    ledcWrite(2, 0); // Start stopped
+}
+
+// Steering Control (Motor A)
+void turnLeft() { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+void turnRight() { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); }
+void steerStraight() { digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); }
+
+// Throttle Control (Motor B)
+void moveForward() {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+
+    int dutyCycle = 255; // keep above stall
+    int pulse = 100;     // how long to run PWM
+    int pause = 50;      // how long to pause motor
+
+    // run motor in pulses to reduce average speed
+    ledcWrite(2, dutyCycle);
+    delay(pulse);
+    ledcWrite(2, 0);
+    delay(pause);
+}
+
+
+void stopCar() {
+    digitalWrite(IN3, LOW); 
+    digitalWrite(IN4, LOW);
+    steerStraight();
+    ledcWrite(2, 0);
+}
 
 // ---------------- PREPROCESS ----------------
-// Optimized to crop center 96x96 from QVGA (320x240)
 void preprocessFrame(camera_fb_t* fb, TfLiteTensor* input){
     int start_x = (fb->width - 96) / 2;
     int start_y = (fb->height - 96) / 2;
     
     for (int y = 0; y < 96; y++) {
         for (int x = 0; x < 96; x++) {
-            // Calculate index in the source QVGA buffer
             int src_idx = ((start_y + y) * fb->width) + (start_x + x);
-            
-            // MobileNetV2 (ImageNet) expects 3 channels (RGB) even if grayscale image
-            // We replicate the grayscale pixel to R, G, and B channels.
-            // INT8 Quantization usually expects range [-128, 127]
-            // We take uint8 (0-255) -> subtract 128 -> int8
+            // Convert 0-255 to -128 to 127 for INT8 model
             int8_t pixel = (int8_t)(fb->buf[src_idx] - 128); 
             
-            input->data.int8[(y * 96 * 3) + (x * 3) + 0] = pixel; // R
-            input->data.int8[(y * 96 * 3) + (x * 3) + 1] = pixel; // G
-            input->data.int8[(y * 96 * 3) + (x * 3) + 2] = pixel; // B
+            // Replicate grayscale to RGB channels (Model expects 3 channels)
+            input->data.int8[(y * 96 * 3) + (x * 3) + 0] = pixel; 
+            input->data.int8[(y * 96 * 3) + (x * 3) + 1] = pixel; 
+            input->data.int8[(y * 96 * 3) + (x * 3) + 2] = pixel; 
         }
     }
 }
 
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
   
-  // 1. Initialize PSRAM for Tensor Arena
+  // 1. Setup Motors
+  setupMotors();
+
+  // 2. Setup PSRAM
   if(psramFound()){
       Serial.println("PSRAM Found! Allocating Arena...");
       tensorArena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM);
   } else {
-      Serial.println("Error: PSRAM not found! Model will not fit.");
+      Serial.println("Error: PSRAM not found! System halted.");
       return; 
   }
 
-  // 2. Camera Init (Use QVGA to be safe, then crop)
+  // 3. Setup Camera
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0; 
   config.ledc_timer = LEDC_TIMER_0;
@@ -99,52 +144,52 @@ void setup() {
   config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM; config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_GRAYSCALE; 
-  config.frame_size = FRAMESIZE_QVGA; // 320x240
+  config.frame_size = FRAMESIZE_QVGA; 
   config.jpeg_quality = 12; 
   config.fb_count = 1;
   
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) { Serial.printf("Camera init failed 0x%x", err); return; }
+  if (esp_camera_init(&config) != ESP_OK) { Serial.println("Camera init failed"); return; }
 
-  // 3. TFLite Init
-  const tflite::Model* model = tflite::GetModel(TinyCamel_Q8_tflite); // Ensure this matches your header array name
+  // 4. Setup TFLite
+  const tflite::Model* model = tflite::GetModel(TinyCamel_Q8_tflite); 
   if (model->version() != TFLITE_SCHEMA_VERSION) {
       Serial.println("Model schema mismatch!");
       return;
   }
-  
   interpreter = new tflite::MicroInterpreter(model, resolver, tensorArena, kTensorArenaSize);
-  TfLiteStatus allocate_status = interpreter->AllocateTensors();
-  if (allocate_status != kTfLiteOk) {
-      Serial.println("AllocateTensors() failed");
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+      Serial.println("AllocateTensors failed");
       return;
   }
   input = interpreter->input(0);
   
-  Serial.println("Setup Complete");
+  // 5. Setup WiFi
+  WiFi.softAP(ssid, password);
+  server.begin();
+
+  Serial.println("Tiny Camel Ready: Steer-Throttle Mode");
 }
 
+// ---------------- LOOP ----------------
 void loop() {
-    // ... (Your WiFi handling logic) ...
-
+    // 1. Capture
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) return;
 
-    // Preprocess: Crop 96x96 from center and normalize
+    // 2. Preprocess
     preprocessFrame(fb, input);
 
-    // Inference
-    TfLiteStatus invoke_status = interpreter->Invoke();
-    if (invoke_status != kTfLiteOk) {
+    // 3. Inference
+    if (interpreter->Invoke() != kTfLiteOk) {
         Serial.println("Invoke failed");
     }
 
-    // Output parsing (INT8)
+    // 4. Post-process
     TfLiteTensor* output = interpreter->output(0);
-    // Values are -128 to 127. The index with the highest value is the prediction.
     int8_t max_score = -128;
-    int pred_class = -1;
+    int pred_class = 0;
     
+    // Find class (0=Forward, 1=Left, 2=Right)
     for (int i = 0; i < 3; i++) {
         if (output->data.int8[i] > max_score) {
             max_score = output->data.int8[i];
@@ -152,9 +197,30 @@ void loop() {
         }
     }
     
-    Serial.printf("Class: %d (Score: %d)\n", pred_class, max_score);
-    
+    Serial.printf("Class: %d (Conf: %d)\n", pred_class, max_score);
 
+    // 5. Motor Logic (Steer-Throttle Config)
+    switch (pred_class) {
+        case 0: // Forward
+            steerStraight(); // Turn wheels straight
+            moveForward();   // Apply throttle
+            break;
+            
+        case 1: // Left
+            turnLeft();      // Turn wheels Left
+            moveForward();   // Apply throttle
+            break;
+            
+        case 2: // Right
+            turnRight();     // Turn wheels Right
+            moveForward();   // Apply throttle
+            break;
+            
+        default:
+            stopCar();
+            break;
+    }
+
+    // 6. Cleanup
     esp_camera_fb_return(fb);
 }
-
