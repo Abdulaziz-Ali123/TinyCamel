@@ -1,1 +1,5 @@
 # TinyCamel
+### Abstract 
+Tiny Camel is a replication and extension of the [DeepPicarMicro](https://arxiv.org/pdf/1712.08644) platform that demonstrates real-time autonomous control using TinyML on the ESP32-S3 microcontroller. Building upon prior work in end-to-end deep learning for autonomous vehicles, we investigate the accuracy-latency trade-offs in resource constrained cyber-physical systems using a more capable MCU with AI acceleration. We implement two distinct vehicle architectures, a traditional front-wheel steering RC car and a differential-drive system using modified servo motors, to study control challenges in TinyML deployment. Using a simplified single-lane track and MobileNetV2-based CNN, we demonstrate autonomous navigation while identifying critical challenges in data quality, motor control granularity, and real-time performance. Our experimental results reveal inference latencies of approximately 800ms and highlight the fundamental tension between model complexity, control responsiveness, and dataset quality in MCU-based autonomous systems.
+
+📄 [Read the full report (PDF)]("Tiny%20Camel%20Real-Time%20TinyML%20Autonomy%20on%20ESP32-S3.pdf")
